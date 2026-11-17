@@ -1,0 +1,10 @@
+name: arena-test
+on:
+  workflow_dispatch:
+  push:
+    branches: [arena/cb3b8e45-aygramv2]
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "actions ok"
