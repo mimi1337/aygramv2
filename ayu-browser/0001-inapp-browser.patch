@@ -1,0 +1,832 @@
+From fab4092b603cbec580738a9fb572359e35c438fc Mon Sep 17 00:00:00 2001
+From: mimi1337 <mimi1337@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:28:17 +0000
+Subject: [PATCH] feat: in-app browser panel
+
+Adds a compact browser inside AyuGram Desktop, built on the WebView
+backend that is already used by the IV/markup editor, so no new
+dependency or engine is required.
+
+* ayu/features/browser: an RpWidget panel with a small toolbar
+  (back / forward / reload / address field / close) and a native
+  WebView under it. The panel is attached inside the chat window,
+  so it never spawns a separate OS window.
+* Entry points: a compact icon in the chat top bar and an
+  "Open browser" item in the main menu, shown only when the
+  platform actually has a working WebView backend.
+* Per-window panel instance, browsing state survives hiding.
+* New ayu styles and three localization keys.
+
+Written against the dev branch of AyuGramDesktop (browser widgets
+are plain RpWidgets, WebView lifetime is owned by the panel).
+---
+ Telegram/CMakeLists.txt                       |   4 +
+ Telegram/Resources/langs/lang.strings         |   4 +
+ .../ayu/features/browser/browser_widget.cpp   | 323 ++++++++++++++++++
+ .../ayu/features/browser/browser_widget.h     |  85 +++++
+ .../ayu/features/browser/browser_window.cpp   | 150 ++++++++
+ .../ayu/features/browser/browser_window.h     |  27 ++
+ Telegram/SourceFiles/ayu/ui/ayu_styles.style  |  52 +++
+ .../view/history_view_top_bar_widget.cpp      |  13 +
+ .../view/history_view_top_bar_widget.h        |   1 +
+ .../SourceFiles/window/window_main_menu.cpp   |  10 +
+ 10 files changed, 669 insertions(+)
+ create mode 100644 Telegram/SourceFiles/ayu/features/browser/browser_widget.cpp
+ create mode 100644 Telegram/SourceFiles/ayu/features/browser/browser_widget.h
+ create mode 100644 Telegram/SourceFiles/ayu/features/browser/browser_window.cpp
+ create mode 100644 Telegram/SourceFiles/ayu/features/browser/browser_window.h
+
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index a957cfd..fcf8f28 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -120,6 +120,10 @@ set(ayugram_files
+         ayu/ayu_lang.h
+         ayu/ayu_infra.cpp
+         ayu/ayu_infra.h
++        ayu/features/browser/browser_widget.cpp
++        ayu/features/browser/browser_widget.h
++        ayu/features/browser/browser_window.cpp
++        ayu/features/browser/browser_window.h
+         ayu/utils/ayu_mapper.cpp
+         ayu/utils/ayu_mapper.h
+         ayu/utils/qt_key_modifiers_extended.h
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+index 7f49208..7211415 100644
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -8780,6 +8780,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ // AyuGram keys generated
+ 
++"ayu_BrowserTitle" = "Browser";
++"ayu_BrowserAddressPlaceholder" = "Enter address or search";
++"ayu_BrowserMenuEntry" = "Open browser";
++
+ "ayu_AyuPreferences" = "AyuGram Preferences";
+ "ayu_DocsText" = "Documentation";
+ "ayu_CategoryGeneral" = "General";
+diff --git a/Telegram/SourceFiles/ayu/features/browser/browser_widget.cpp b/Telegram/SourceFiles/ayu/features/browser/browser_widget.cpp
+new file mode 100644
+index 0000000..62182f5
+--- /dev/null
++++ b/Telegram/SourceFiles/ayu/features/browser/browser_widget.cpp
+@@ -0,0 +1,323 @@
++// This is the source code of AyuGram for Desktop.
++//
++// We do not and cannot prevent the use of our code,
++// but be respectful and credit the original author.
++//
++// Copyright @Radolyn, 2026
++#include "ayu/features/browser/browser_widget.h"
++
++#include "core/cached_webview_availability.h"
++#include "lang_auto.h"
++#include "styles/style_ayu_styles.h"
++#include "ui/painter.h"
++#include "ui/qt_object_factory.h"
++#include "ui/widgets/buttons.h"
++#include "ui/widgets/fields/input_field.h"
++#include "ui/widgets/labels.h"
++#include "webview/webview_common.h"
++#include "webview/webview_embed.h"
++#include "webview/webview_interface.h"
++
++#include <QtCore/QUrl>
++#include <QtCore/QPointer>
++#include <QtGui/QResizeEvent>
++#include <QtWidgets/QWidget>
++
++#include <algorithm>
++
++namespace AyuFeatures::Browser {
++namespace {
++
++constexpr auto kToolbarHeight = 44;
++constexpr auto kToolbarSkip = 6;
++constexpr auto kAddressMinWidth = 60;
++constexpr auto kMaxAddressWidth = 260;
++
++[[nodiscard]] QString WithScheme(QString url) {
++	const auto trimmed = url.trimmed();
++	if (trimmed.isEmpty()) {
++		return QString();
++	}
++	const auto parsed = QUrl(trimmed);
++	if (!parsed.scheme().isEmpty()) {
++		return trimmed;
++	}
++	// Looks like a host: no spaces and a dot inside.
++	if (!trimmed.contains(' ') && trimmed.contains('.')) {
++		return u"https://"_q + trimmed;
++	}
++	// Otherwise treat it as a search query.
++	return u"https://duckduckgo.com/?q="_q
++		+ QString::fromUtf8(QUrl::toPercentEncoding(trimmed));
++}
++
++} // namespace
++
++struct WebviewHolder {
++	WebviewHolder(QWidget *parent, Webview::WindowConfig config)
++	: window(parent, std::move(config)) {
++	}
++
++	Webview::Window window;
++	rpl::lifetime lifetime;
++};
++
++bool Available() {
++	return Core::CachedWebviewAvailability().error
++		== Webview::Available::Error::None;
++}
++
++Widget::Widget(
++	QWidget *parent,
++	Webview::StorageId storageId,
++	bool safe)
++: RpWidget(parent)
++, _storageId(std::move(storageId))
++, _safe(safe) {
++	setupToolbar();
++	setupWebview();
++	hide();
++}
++
++void Widget::setupToolbar() {
++	_back = Ui::CreateChild<Ui::IconButton>(this, st::ayuBrowserBack);
++	_back->setClickedCallback([=] { if (const auto w = QPointer<Widget>(this)) w->goBack(); });
++	_back->setDisabled(true);
++	_back->show();
++
++	_forward = Ui::CreateChild<Ui::IconButton>(this, st::ayuBrowserForward);
++	_forward->setClickedCallback([=] { if (const auto w = QPointer<Widget>(this)) w->goForward(); });
++	_forward->setDisabled(true);
++	_forward->show();
++
++	_reload = Ui::CreateChild<Ui::IconButton>(this, st::ayuBrowserReload);
++	_reload->setClickedCallback([=] { if (const auto w = QPointer<Widget>(this)) w->reload(); });
++	_reload->show();
++
++	_close = Ui::CreateChild<Ui::IconButton>(this, st::ayuBrowserClose);
++	_close->setClickedCallback([=] { if (const auto w = QPointer<Widget>(this)) w->hidePanel(); });
++	_close->show();
++
++	_address = Ui::CreateChild<Ui::InputField>(
++		this,
++		st::ayuBrowserAddress,
++		Ui::InputField::Mode::NoNewlines,
++		rpl::single(QString(u"https://"_q)));
++	_address->setPlaceholder(
++		rpl::single(tr::ayu_BrowserAddressPlaceholder()));
++	_address->submits(
++	) | rpl::on_next([=](Qt::KeyboardModifiers) {
++		navigate();
++	}, _address->lifetime());
++	_address->show();
++
++	_error = Ui::CreateChild<Ui::FlatLabel>(this, st::ayuBrowserErrorLabel);
++	_error->setText(
++		u"WebView is unavailable on this platform."_q);
++	_error->hide();
++}
++
++void Widget::setupWebview() {
++	if (!_storageId || !Available()) {
++		_error->show();
++		return;
++	}
++	_webview = std::make_unique<WebviewHolder>(
++		this,
++		Webview::WindowConfig{
++			.opaqueBg = st::windowBg->c,
++			.storageId = _storageId,
++			.safe = _safe,
++		});
++	const auto raw = &_webview->window;
++
++	const auto view = raw->widget();
++	if (!view) {
++		// The backend failed to start (no WebView2 / WebKitGTK installed).
++		_webview = nullptr;
++		_error->show();
++		return;
++	}
++	_webviewReady = true;
++	view->hide();
++
++	const auto weak = QPointer<Widget>(this);
++	raw->setNavigationStartHandler([=](const QString &uri, bool newWindow) {
++		Q_UNUSED(newWindow);
++		if (uri != u"about:blank"_q) {
++			_address->setText(uri);
++		}
++		return true;
++	});
++	raw->setNavigationDoneHandler([=](bool success) {
++		Q_UNUSED(success);
++		if (weak) {
++			weak->updateHistoryButtons();
++		}
++	});
++	raw->navigationHistoryState(
++	) | rpl::on_next([=](Webview::NavigationHistoryState state) {
++		_back->setDisabled(!state.canGoBack);
++		_forward->setDisabled(!state.canGoForward);
++		if (!state.url.empty()) {
++			const auto url = QString::fromStdString(state.url);
++			if (url != u"about:blank"_q) {
++				_address->setText(url);
++			}
++		}
++	}, _webview->lifetime);
++
++	raw->init(R"()");
++}
++
++bool Widget::showFor(QString url) {
++	if (!_webviewReady) {
++		_error->raise();
++		_error->show();
++		show();
++		return false;
++	}
++	show();
++	raise();
++	if (const auto resolved = resolveUrl(url); !resolved.isEmpty()) {
++		_webview->window.navigate(resolved);
++	}
++	if (const auto view = _webview->window.widget()) {
++		view->show();
++		view->raise();
++	}
++	updateControlsGeometry();
++	_webview->window.focus();
++	return true;
++}
++
++void Widget::showDefault() {
++	showFor(QString());
++	_address->setFocus();
++}
++
++Widget::~Widget() {
++	// The native WebView must be gone before the child widgets it overlaps.
++	_webview = nullptr;
++}
++
++void Widget::hidePanel() {
++	hide();
++	if (_webviewReady && _webview) {
++		if (const auto view = _webview->window.widget()) {
++			view->hide();
++		}
++	}
++}
++
++QString Widget::resolveUrl(const QString &input) const {
++	return WithScheme(input);
++}
++
++void Widget::navigate() {
++	if (!_webviewReady || !_webview) {
++		return;
++	}
++	if (const auto url = resolveUrl(_address->getLastText()); !url.isEmpty()) {
++		_webview->window.navigate(url);
++	}
++}
++
++void Widget::reload() {
++	if (_webviewReady && _webview) {
++		_webview->window.reload();
++	}
++}
++
++void Widget::goBack() {
++	if (_webviewReady && _webview) {
++		_webview->window.eval("window.history.back();");
++	}
++}
++
++void Widget::goForward() {
++	if (_webviewReady && _webview) {
++		_webview->window.eval("window.history.forward();");
++	}
++}
++
++void Widget::updateHistoryButtons() {
++	if (_webviewReady && _webview) {
++		_webview->window.refreshNavigationHistoryState();
++	}
++}
++
++void Widget::updateControlsGeometry() {
++	const auto toolbarTop = kToolbarSkip;
++	const auto toolbarLeft = kToolbarSkip;
++	const auto toolbarWidth = std::max(
++		width() - 2 * kToolbarSkip,
++		st::ayuBrowserBack.width * 4);
++	const auto toolbar = QRect(
++		toolbarLeft,
++		toolbarTop,
++		toolbarWidth,
++		kToolbarHeight);
++
++	auto left = toolbar.x();
++	const auto placeLeft = [&](not_null<Ui::RpWidget*> widget) {
++		const auto size = widget->size();
++		const auto top = toolbar.y() + (kToolbarHeight - size.height()) / 2;
++		widget->move(left, top);
++		left += size.width();
++	};
++	placeLeft(_back);
++	placeLeft(_forward);
++	placeLeft(_reload);
++
++	auto right = toolbar.x() + toolbar.width();
++	const auto closeWidth = _close->width();
++	_close->move(
++		right - closeWidth,
++		toolbar.y() + (kToolbarHeight - _close->height()) / 2);
++	right -= closeWidth;
++
++	const auto addressLeft = left;
++	const auto addressWidth = std::clamp(
++		right - addressLeft - kToolbarSkip * 2,
++		0,
++		kMaxAddressWidth);
++	_address->setGeometryToLeft(
++		addressLeft,
++		toolbar.y() + (kToolbarHeight - _address->height()) / 2,
++		std::max(addressWidth, 0),
++		_address->height());
++
++	const auto contentTop = toolbar.y() + kToolbarHeight + kToolbarSkip;
++	const auto contentWidth = toolbar.width();
++	const auto contentHeight = std::max(height() - contentTop - kToolbarSkip, 0);
++
++	if (_error) {
++		_error->setGeometry(
++			toolbar.x(),
++			contentTop,
++			contentWidth,
++			_error->height());
++	}
++	if (_webviewReady && _webview) {
++		if (const auto view = _webview->window.widget()) {
++			view->setGeometry(
++				toolbar.x(),
++				contentTop,
++				contentWidth,
++				contentHeight);
++		}
++	}
++}
++
++void Widget::paintEvent(QPaintEvent *) {
++	auto p = QPainter(this);
++	p.fillRect(rect(), st::windowBg);
++}
++
++void Widget::resizeEvent(QResizeEvent *e) {
++	RpWidget::resizeEvent(e);
++	updateControlsGeometry();
++}
++
++} // namespace AyuFeatures::Browser
+diff --git a/Telegram/SourceFiles/ayu/features/browser/browser_widget.h b/Telegram/SourceFiles/ayu/features/browser/browser_widget.h
+new file mode 100644
+index 0000000..e7ad513
+--- /dev/null
++++ b/Telegram/SourceFiles/ayu/features/browser/browser_widget.h
+@@ -0,0 +1,85 @@
++// This is the source code of AyuGram for Desktop.
++//
++// We do not and cannot prevent the use of our code,
++// but be respectful and credit the original author.
++//
++// Copyright @Radolyn, 2026
++#pragma once
++
++#include "ui/rp_widget.h"
++
++#include <memory>
++
++namespace Ui {
++class IconButton;
++class InputField;
++class FlatLabel;
++} // namespace Ui
++
++namespace Webview {
++struct StorageId;
++} // namespace Webview
++
++namespace AyuFeatures::Browser {
++
++// A compact in-window browser panel: a small toolbar (back / forward / reload /
++// address field / close) and a native WebView under it.
++//
++// The panel is a plain RpWidget, not a window, so it is attached *inside* an
++// existing window and never spawns a separate OS window.
++class Widget final : public Ui::RpWidget {
++public:
++	Widget(
++		QWidget *parent,
++		Webview::StorageId storageId,
++		bool safe);
++	~Widget() override;
++
++	// Navigates to `url` (a scheme is guessed when it is missing) and shows
++	// the panel. Returns false when the WebView backend is unavailable.
++	bool showFor(QString url);
++
++	// Shows the panel on the default page.
++	void showDefault();
++
++	void hidePanel();
++	[[nodiscard]] bool shown() const {
++		return !isHidden();
++	}
++
++protected:
++	void paintEvent(QPaintEvent *e) override;
++	void resizeEvent(QResizeEvent *e) override;
++
++private:
++	void setupToolbar();
++	void setupWebview();
++	void updateControlsGeometry();
++	void updateHistoryButtons();
++	[[nodiscard]] QString resolveUrl(const QString &input) const;
++
++	void navigate();
++	void reload();
++	void goBack();
++	void goForward();
++
++	Webview::StorageId _storageId;
++	const bool _safe = false;
++
++	Ui::IconButton *_back = nullptr;
++	Ui::IconButton *_forward = nullptr;
++	Ui::IconButton *_reload = nullptr;
++	Ui::IconButton *_close = nullptr;
++	Ui::InputField *_address = nullptr;
++	Ui::FlatLabel *_error = nullptr;
++
++	std::unique_ptr<struct WebviewHolder> _webview;
++
++	bool _webviewReady = false;
++
++};
++
++// Returns true when the current platform has a working WebView backend.
++[[nodiscard]] bool Available();
++
++} // namespace AyuFeatures::Browser
+diff --git a/Telegram/SourceFiles/ayu/features/browser/browser_window.cpp b/Telegram/SourceFiles/ayu/features/browser/browser_window.cpp
+new file mode 100644
+index 0000000..1820c8d
+--- /dev/null
++++ b/Telegram/SourceFiles/ayu/features/browser/browser_window.cpp
+@@ -0,0 +1,150 @@
++// This is the source code of AyuGram for Desktop.
++//
++// We do not and cannot prevent the use of our code,
++// but be respectful and credit the original author.
++//
++// Copyright @Radolyn, 2026
++#include "ayu/features/browser/browser_window.h"
++
++#include "ayu/features/browser/browser_widget.h"
++#include "mainwidget.h"
++#include "storage/storage_account.h"
++#include "ui/qt_object_factory.h"
++#include "window/window_session_controller.h"
++
++#include <QtCore/QEvent>
++#include <QtCore/QPointer>
++#include <QtGui/QResizeEvent>
++#include <QtWidgets/QWidget>
++
++namespace AyuFeatures::Browser {
++namespace {
++
++// Panel width: a comfortable reading width, but never more
++// than half of the window.
++constexpr auto kPanelPreferredWidth = 440;
++constexpr auto kPanelMinWidth = 320;
++constexpr auto kPanelSkip = 0;
++
++[[nodiscard]] QRect PanelGeometry(not_null<QWidget*> parent) {
++	const auto available = parent->rect();
++	const auto half = available.width() / 2;
++	const auto width = std::clamp(
++		kPanelPreferredWidth,
++		std::min(kPanelMinWidth, available.width()),
++		std::max(half, kPanelMinWidth));
++	return QRect(
++		available.x() + available.width() - width + kPanelSkip,
++		available.y(),
++		width,
++		available.height());
++}
++
++// Keeps the panel in sync with the size of the window it is attached to.
++class Host final : public QObject {
++public:
++	Host(
++		not_null<Window::SessionController*> controller,
++		not_null<QWidget*> parent);
++
++	void show(QString url);
++	void hide();
++	[[nodiscard]] bool shown() const;
++
++private:
++	bool eventFilter(QObject *watched, QEvent *event) override;
++	void updateGeometry();
++
++	const not_null<Window::SessionController*> _controller;
++	const not_null<QWidget*> _parent;
++	Widget *_panel = nullptr;
++
++};
++
++Host::Host(
++	not_null<Window::SessionController*> controller,
++	not_null<QWidget*> parent)
++: QObject(parent.get())
++, _controller(controller)
++, _parent(parent) {
++	_parent->installEventFilter(this);
++}
++
++void Host::show(QString url) {
++	if (!_panel) {
++		_panel = Ui::CreateChild<Widget>(
++			_parent,
++			_controller->session().local().resolveStorageIdOther(),
++			true);
++	}
++	updateGeometry();
++	_panel->raise();
++	if (url.isEmpty()) {
++		_panel->showDefault();
++	} else {
++		_panel->showFor(std::move(url));
++	}
++}
++
++void Host::hide() {
++	if (_panel) {
++		_panel->hidePanel();
++	}
++}
++
++bool Host::shown() const {
++	return _panel && !_panel->isHidden();
++}
++
++bool Host::eventFilter(QObject *watched, QEvent *event) {
++	if (watched == _parent.get()
++		&& event->type() == QEvent::Resize) {
++		updateGeometry();
++	}
++	return QObject::eventFilter(watched, event);
++}
++
++void Host::updateGeometry() {
++	if (!_panel) {
++		return;
++	}
++	_panel->setGeometry(PanelGeometry(_parent));
++}
++
++[[nodiscard]] Host *FindHost(not_null<QWidget*> parent) {
++	return parent->findChild<Host*>(
++		QStringLiteral("ayuBrowserHost"),
++		Qt::FindDirectChildrenOnly);
++}
++
++} // namespace
++
++void Open(not_null<Window::SessionController*> controller, QString url) {
++	const auto parent = controller->widget()
++		? static_cast<QWidget*>(controller->widget())
++		: nullptr;
++	if (!parent) {
++		return;
++	}
++	if (const auto existing = QPointer<Host>(FindHost(parent))) {
++		existing->show(std::move(url));
++		return;
++	}
++	const auto host = new Host(controller, parent);
++	host->setObjectName(QStringLiteral("ayuBrowserHost"));
++	host->show(std::move(url));
++}
++
++void Close(not_null<Window::SessionController*> controller) {
++	const auto parent = controller->widget()
++		? static_cast<QWidget*>(controller->widget())
++		: nullptr;
++	if (!parent) {
++		return;
++	}
++	if (const auto existing = QPointer<Host>(FindHost(parent))) {
++		existing->hide();
++	}
++}
++
++} // namespace AyuFeatures::Browser
+diff --git a/Telegram/SourceFiles/ayu/features/browser/browser_window.h b/Telegram/SourceFiles/ayu/features/browser/browser_window.h
+new file mode 100644
+index 0000000..0f6ed75
+--- /dev/null
++++ b/Telegram/SourceFiles/ayu/features/browser/browser_window.h
+@@ -0,0 +1,27 @@
++// This is the source code of AyuGram for Desktop.
++//
++// We do not and cannot prevent the use of our code,
++// but be respectful and credit the original author.
++//
++// Copyright @Radolyn, 2026
++#pragma once
++
++#include <QtCore/QString>
++
++namespace Window {
++class SessionController;
++} // namespace Window
++
++namespace AyuFeatures::Browser {
++
++// Shows the in-app browser panel inside the main window of `controller`.
++// The panel is created on first use and then reused (only shown / hidden),
++// so the browsing session and cookies survive re-opening.
++//
++// An empty `url` opens the default page.
++void Open(not_null<Window::SessionController*> controller, QString url = {});
++
++// Hides the panel if it was created for that window.
++void Close(not_null<Window::SessionController*> controller);
++
++} // namespace AyuFeatures::Browser
+diff --git a/Telegram/SourceFiles/ayu/ui/ayu_styles.style b/Telegram/SourceFiles/ayu/ui/ayu_styles.style
+index 66059b4..6390998 100644
+--- a/Telegram/SourceFiles/ayu/ui/ayu_styles.style
++++ b/Telegram/SourceFiles/ayu/ui/ayu_styles.style
+@@ -124,3 +124,55 @@ ayuServiceTimeBadgeVerticalPadding: 2px;
+ ayuServiceTimeBadgeGap: 8px;
+ ayuServiceTimeBadgeTrailingInset: 3px;
+ ayuServiceTimeBadgeLastLineWidthAdd: 9px;
++
++// AyuGram in-app browser (see ayu/features/browser/)
++ayuBrowserBack: IconButton(defaultIconButton) {
++	width: 32px;
++	height: 32px;
++
++	icon: icon {{ "box_button_back", menuIconColor }};
++	iconOver: icon {{ "box_button_back", menuIconFg }};
++	iconPosition: point(4px, 4px);
++	rippleAreaPosition: point(0px, 0px);
++	rippleAreaSize: 32px;
++	ripple: defaultRippleAnimationBgOver;
++}
++ayuBrowserForward: IconButton(ayuBrowserBack) {
++	icon: icon {{ "box_button_back-flip_horizontal", menuIconColor }};
++	iconOver: icon {{ "box_button_back-flip_horizontal", menuIconFg }};
++}
++ayuBrowserReload: IconButton(ayuBrowserBack) {
++	icon: icon {{ "settings/reload", menuIconColor }};
++	iconOver: icon {{ "settings/reload", menuIconFg }};
++}
++ayuBrowserClose: IconButton(ayuBrowserBack) {
++	icon: icon {{ "simple_close", menuIconColor }};
++	iconOver: icon {{ "simple_close", menuIconFg }};
++}
++ayuBrowserAddress: InputField(defaultInputField) {
++	heightMin: 32px;
++	heightMax: 32px;
++	textMargins: margins(10px, 0px, 10px, 0px);
++	placeholderMargins: margins(10px, 0px, 10px, 0px);
++	placeholderShift: 0px;
++	borderRadius: 8px;
++	border: 1px;
++	borderActive: 1px;
++}
++ayuBrowserErrorLabel: FlatLabel(defaultFlatLabel) {
++	textFg: boxTitleFg;
++}
++
++// Compact chat top bar button that opens the in-app browser.
++ayuBrowserTopBar: IconButton {
++	width: 40px;
++	height: topBarHeight;
++
++	icon: icon {{ "menu/link", menuIconFg }};
++	iconOver: icon {{ "menu/link", menuIconFgOver }};
++	iconPosition: point(8px, 8px);
++
++	rippleAreaPosition: point(4px, 4px);
++	rippleAreaSize: 32px;
++	ripple: defaultRippleAnimationBgOver;
++}
+diff --git a/Telegram/SourceFiles/history/view/history_view_top_bar_widget.cpp b/Telegram/SourceFiles/history/view/history_view_top_bar_widget.cpp
+index bb75eeb..cf28a27 100644
+--- a/Telegram/SourceFiles/history/view/history_view_top_bar_widget.cpp
++++ b/Telegram/SourceFiles/history/view/history_view_top_bar_widget.cpp
+@@ -74,6 +74,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/browser/browser_window.h"
+ #include "boxes/peers/edit_participants_box.h"
+ #include "data/data_chat_filters.h"
+ #include "history/admin_log/history_admin_log_section.h"
+@@ -140,6 +141,7 @@ TopBarWidget::TopBarWidget(
+ , _menuToggle(this, st::topBarMenuToggle)
+ , _recentActions(this, st::topBarRecentActions)
+ , _admins(this, st::topBarAdmins)
++, _ayuBrowser(this, st::ayuBrowserTopBar)
+ , _titlePeerText(st::windowMinWidth / 3)
+ , _onlineUpdater([=] { updateOnlineDisplay(); }) {
+ 	setAttribute(Qt::WA_OpaquePaintEvent);
+@@ -189,6 +191,10 @@ TopBarWidget::TopBarWidget(
+ 			ParticipantsBoxController::Role::Admins
+ 		);
+ 	});
++	_ayuBrowser->setClickedCallback([=]
++	{
++		AyuFeatures::Browser::Open(_controller);
++	});
+ 
+ 	AyuSettings::getInstance().quickAdminShortcutsChanges(
+ 	) | rpl::on_next([=](bool) {
+@@ -1337,6 +1343,10 @@ void TopBarWidget::updateControlsGeometry() {
+ 	if (!_admins->isHidden()) {
+ 		_rightTaken += _admins->width();
+ 	}
++	_ayuBrowser->moveToRight(_rightTaken, otherButtonsTop);
++	if (!_ayuBrowser->isHidden()) {
++		_rightTaken += _ayuBrowser->width();
++	}
+ 
+ 	_search->moveToRight(_rightTaken, otherButtonsTop);
+ 	if (!_search->isHidden()) {
+@@ -1495,6 +1505,9 @@ void TopBarWidget::updateControlsVisibility() {
+ 		return false;
+ 	}();
+ 	_admins->setVisible(showAdmins);
++	_ayuBrowser->setVisible(
++		AyuFeatures::Browser::Available()
++			&& (_activeChat.section != Section::ChatsList));
+ 
+ 	const auto callsEnabled = [&] {
+ 		if (const auto peer = _activeChat.key.peer()) {
+diff --git a/Telegram/SourceFiles/history/view/history_view_top_bar_widget.h b/Telegram/SourceFiles/history/view/history_view_top_bar_widget.h
+index 854ff24..ac2f7e4 100644
+--- a/Telegram/SourceFiles/history/view/history_view_top_bar_widget.h
++++ b/Telegram/SourceFiles/history/view/history_view_top_bar_widget.h
+@@ -262,6 +262,7 @@ private:
+ 	object_ptr<Ui::IconButton> _menuToggle;
+ 	object_ptr<Ui::IconButton> _recentActions;
+ 	object_ptr<Ui::IconButton> _admins;
++	object_ptr<Ui::IconButton> _ayuBrowser;
+ 	base::unique_qptr<Ui::PopupMenu> _menu;
+ 	base::weak_qptr<Ui::IconButton> _menuButton;
+ 
+diff --git a/Telegram/SourceFiles/window/window_main_menu.cpp b/Telegram/SourceFiles/window/window_main_menu.cpp
+index 642947a..cde61ca 100644
+--- a/Telegram/SourceFiles/window/window_main_menu.cpp
++++ b/Telegram/SourceFiles/window/window_main_menu.cpp
+@@ -82,6 +82,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/browser/browser_window.h"
+ #include "ayu/utils/telegram_helpers.h"
+ #include "boxes/abstract_box.h"
+ #include "styles/style_ayu_icons.h"
+@@ -846,6 +847,15 @@ void MainMenu::setupMenu() {
+ 		controller->showSettings();
+ 	});
+ 
++	if (AyuFeatures::Browser::Available()) {
++		addAction(
++			tr::ayu_BrowserMenuEntry(),
++			{ &st::menuIconLink }
++		)->setClickedCallback([=] {
++			AyuFeatures::Browser::Open(controller);
++		});
++	}
++
+ 	if (settings.showNightModeToggleInDrawer()) {
+ 
+ 	_nightThemeToggle = addAction(
+-- 
+2.39.5
+

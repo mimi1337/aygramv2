@@ -1,0 +1,182 @@
+diff --git a/Telegram/CMakeLists.txt b/Telegram/CMakeLists.txt
+index a957cfd..fcf8f28 100644
+--- a/Telegram/CMakeLists.txt
++++ b/Telegram/CMakeLists.txt
+@@ -120,6 +120,10 @@ set(ayugram_files
+         ayu/ayu_lang.h
+         ayu/ayu_infra.cpp
+         ayu/ayu_infra.h
++        ayu/features/browser/browser_widget.cpp
++        ayu/features/browser/browser_widget.h
++        ayu/features/browser/browser_window.cpp
++        ayu/features/browser/browser_window.h
+         ayu/utils/ayu_mapper.cpp
+         ayu/utils/ayu_mapper.h
+         ayu/utils/qt_key_modifiers_extended.h
+diff --git a/Telegram/Resources/langs/lang.strings b/Telegram/Resources/langs/lang.strings
+index 7f49208..7211415 100644
+--- a/Telegram/Resources/langs/lang.strings
++++ b/Telegram/Resources/langs/lang.strings
+@@ -8780,6 +8780,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ // AyuGram keys generated
+ 
++"ayu_BrowserTitle" = "Browser";
++"ayu_BrowserAddressPlaceholder" = "Enter address or search";
++"ayu_BrowserMenuEntry" = "Open browser";
++
+ "ayu_AyuPreferences" = "AyuGram Preferences";
+ "ayu_DocsText" = "Documentation";
+ "ayu_CategoryGeneral" = "General";
+diff --git a/Telegram/SourceFiles/ayu/ui/ayu_styles.style b/Telegram/SourceFiles/ayu/ui/ayu_styles.style
+index 66059b4..6390998 100644
+--- a/Telegram/SourceFiles/ayu/ui/ayu_styles.style
++++ b/Telegram/SourceFiles/ayu/ui/ayu_styles.style
+@@ -124,3 +124,55 @@ ayuServiceTimeBadgeVerticalPadding: 2px;
+ ayuServiceTimeBadgeGap: 8px;
+ ayuServiceTimeBadgeTrailingInset: 3px;
+ ayuServiceTimeBadgeLastLineWidthAdd: 9px;
++
++// AyuGram in-app browser (see ayu/features/browser/)
++ayuBrowserBack: IconButton(defaultIconButton) {
++	width: 32px;
++	height: 32px;
++
++	icon: icon {{ "box_button_back", menuIconColor }};
++	iconOver: icon {{ "box_button_back", menuIconFg }};
++	iconPosition: point(4px, 4px);
++	rippleAreaPosition: point(0px, 0px);
++	rippleAreaSize: 32px;
++	ripple: defaultRippleAnimationBgOver;
++}
++ayuBrowserForward: IconButton(ayuBrowserBack) {
++	icon: icon {{ "box_button_back-flip_horizontal", menuIconColor }};
++	iconOver: icon {{ "box_button_back-flip_horizontal", menuIconFg }};
++}
++ayuBrowserReload: IconButton(ayuBrowserBack) {
++	icon: icon {{ "settings/reload", menuIconColor }};
++	iconOver: icon {{ "settings/reload", menuIconFg }};
++}
++ayuBrowserClose: IconButton(ayuBrowserBack) {
++	icon: icon {{ "simple_close", menuIconColor }};
++	iconOver: icon {{ "simple_close", menuIconFg }};
++}
++ayuBrowserAddress: InputField(defaultInputField) {
++	heightMin: 32px;
++	heightMax: 32px;
++	textMargins: margins(10px, 0px, 10px, 0px);
++	placeholderMargins: margins(10px, 0px, 10px, 0px);
++	placeholderShift: 0px;
++	borderRadius: 8px;
++	border: 1px;
++	borderActive: 1px;
++}
++ayuBrowserErrorLabel: FlatLabel(defaultFlatLabel) {
++	textFg: boxTitleFg;
++}
++
++// Compact chat top bar button that opens the in-app browser.
++ayuBrowserTopBar: IconButton {
++	width: 40px;
++	height: topBarHeight;
++
++	icon: icon {{ "menu/link", menuIconFg }};
++	iconOver: icon {{ "menu/link", menuIconFgOver }};
++	iconPosition: point(8px, 8px);
++
++	rippleAreaPosition: point(4px, 4px);
++	rippleAreaSize: 32px;
++	ripple: defaultRippleAnimationBgOver;
++}
+diff --git a/Telegram/SourceFiles/history/view/history_view_top_bar_widget.cpp b/Telegram/SourceFiles/history/view/history_view_top_bar_widget.cpp
+index bb75eeb..cf28a27 100644
+--- a/Telegram/SourceFiles/history/view/history_view_top_bar_widget.cpp
++++ b/Telegram/SourceFiles/history/view/history_view_top_bar_widget.cpp
+@@ -74,6 +74,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/browser/browser_window.h"
+ #include "boxes/peers/edit_participants_box.h"
+ #include "data/data_chat_filters.h"
+ #include "history/admin_log/history_admin_log_section.h"
+@@ -140,6 +141,7 @@ TopBarWidget::TopBarWidget(
+ , _menuToggle(this, st::topBarMenuToggle)
+ , _recentActions(this, st::topBarRecentActions)
+ , _admins(this, st::topBarAdmins)
++, _ayuBrowser(this, st::ayuBrowserTopBar)
+ , _titlePeerText(st::windowMinWidth / 3)
+ , _onlineUpdater([=] { updateOnlineDisplay(); }) {
+ 	setAttribute(Qt::WA_OpaquePaintEvent);
+@@ -189,6 +191,10 @@ TopBarWidget::TopBarWidget(
+ 			ParticipantsBoxController::Role::Admins
+ 		);
+ 	});
++	_ayuBrowser->setClickedCallback([=]
++	{
++		AyuFeatures::Browser::Open(_controller);
++	});
+ 
+ 	AyuSettings::getInstance().quickAdminShortcutsChanges(
+ 	) | rpl::on_next([=](bool) {
+@@ -1337,6 +1343,10 @@ void TopBarWidget::updateControlsGeometry() {
+ 	if (!_admins->isHidden()) {
+ 		_rightTaken += _admins->width();
+ 	}
++	_ayuBrowser->moveToRight(_rightTaken, otherButtonsTop);
++	if (!_ayuBrowser->isHidden()) {
++		_rightTaken += _ayuBrowser->width();
++	}
+ 
+ 	_search->moveToRight(_rightTaken, otherButtonsTop);
+ 	if (!_search->isHidden()) {
+@@ -1495,6 +1505,9 @@ void TopBarWidget::updateControlsVisibility() {
+ 		return false;
+ 	}();
+ 	_admins->setVisible(showAdmins);
++	_ayuBrowser->setVisible(
++		AyuFeatures::Browser::Available()
++			&& (_activeChat.section != Section::ChatsList));
+ 
+ 	const auto callsEnabled = [&] {
+ 		if (const auto peer = _activeChat.key.peer()) {
+diff --git a/Telegram/SourceFiles/history/view/history_view_top_bar_widget.h b/Telegram/SourceFiles/history/view/history_view_top_bar_widget.h
+index 854ff24..ac2f7e4 100644
+--- a/Telegram/SourceFiles/history/view/history_view_top_bar_widget.h
++++ b/Telegram/SourceFiles/history/view/history_view_top_bar_widget.h
+@@ -262,6 +262,7 @@ private:
+ 	object_ptr<Ui::IconButton> _menuToggle;
+ 	object_ptr<Ui::IconButton> _recentActions;
+ 	object_ptr<Ui::IconButton> _admins;
++	object_ptr<Ui::IconButton> _ayuBrowser;
+ 	base::unique_qptr<Ui::PopupMenu> _menu;
+ 	base::weak_qptr<Ui::IconButton> _menuButton;
+ 
+diff --git a/Telegram/SourceFiles/window/window_main_menu.cpp b/Telegram/SourceFiles/window/window_main_menu.cpp
+index 642947a..cde61ca 100644
+--- a/Telegram/SourceFiles/window/window_main_menu.cpp
++++ b/Telegram/SourceFiles/window/window_main_menu.cpp
+@@ -82,6 +82,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
+ 
+ // AyuGram includes
+ #include "ayu/ayu_settings.h"
++#include "ayu/features/browser/browser_window.h"
+ #include "ayu/utils/telegram_helpers.h"
+ #include "boxes/abstract_box.h"
+ #include "styles/style_ayu_icons.h"
+@@ -846,6 +847,15 @@ void MainMenu::setupMenu() {
+ 		controller->showSettings();
+ 	});
+ 
++	if (AyuFeatures::Browser::Available()) {
++		addAction(
++			tr::ayu_BrowserMenuEntry(),
++			{ &st::menuIconLink }
++		)->setClickedCallback([=] {
++			AyuFeatures::Browser::Open(controller);
++		});
++	}
++
+ 	if (settings.showNightModeToggleInDrawer()) {
+ 
+ 	_nightThemeToggle = addAction(
